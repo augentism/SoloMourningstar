@@ -110,7 +110,18 @@ under a hub you are standing in.
   select still works.
 - **Debug logging** — session boot and mechanism changes to the console log.
 
-`/solohub` in chat reports host type, mechanism and game mode.
+`/solohub` in chat reports the mod version, host type, mechanism, game mode and
+presence.
+
+## Releasing
+
+```
+python .claude/skills/darktide-mod/scripts/release_mod.py SoloMourningstar
+```
+
+Writes `releases/SoloMourningstar-<version>.zip`. The version is `mod.version`
+at the top of the main Lua file — bump it there, since the script refuses to
+overwrite an existing zip.
 
 ## What this gives up
 

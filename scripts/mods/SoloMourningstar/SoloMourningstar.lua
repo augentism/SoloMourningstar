@@ -1,5 +1,10 @@
 local mod = get_mod("SoloMourningstar")
 
+-- Single source of truth for the version: release_mod.py reads it from here to
+-- name the zip, and /solohub reports it so a user's screenshot says which build
+-- they are on.
+mod.version = "0.1.0"
+
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
 -- browse and join the lobby, then sync profiles and load the item packages of up
@@ -225,7 +230,7 @@ mod:command("solohub", mod:localize("command_description"), function ()
 	local game_mode_manager = Managers.state and Managers.state.game_mode
 	local game_mode_name = game_mode_manager and game_mode_manager:game_mode_name() or "none"
 
-	mod:echo("Solo Mourningstar: " .. (_solo_enabled() and "on" or "off"))
+	mod:echo("Solo Mourningstar " .. mod.version .. ": " .. (_solo_enabled() and "on" or "off"))
 	mod:echo("  host type: " .. tostring(host_type))
 	mod:echo("  mechanism: " .. tostring(mechanism_name))
 	mod:echo("  game mode: " .. tostring(game_mode_name))
