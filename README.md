@@ -3,6 +3,18 @@
 Loads the Mourningstar as a private, locally hosted instance instead of joining
 a public hub server.
 
+## Requirements
+
+DMF only. Every `require` in the mod is a game script and it calls `get_mod` on
+nothing but itself.
+
+In particular it does **not** need SoloPlay: that mod drives
+`HOST_TYPES.singleplay` for *mission* sessions, while this one hosts the *hub*.
+`boot_singleplayer_session` is vanilla API — the Psykhanium uses it unmodded —
+and missions launched from the private hub go through `party_immaterium` as
+normal. (Testing has all been done with SoloPlay present, so that is reasoning
+from the code rather than an observation.)
+
 ## Why it works
 
 The hub level is local content and the hub mechanism already supports running
@@ -101,6 +113,127 @@ through when `_in_solo_hub()` is already true — joining the party's hub server
 the point of the vote, and re-booting there would swap the live session out from
 under a hub you are standing in.
 
+## Pacing (the specials_pacing crash)
+
+Hosting the hub creates server-only managers a hub client never has:
+`gameplay_init_step_managers.lua` builds `Managers.state.pacing` only
+`if is_server`. `SpecialsPacing` is the one sub-pacer whose template does not
+come from `PacingManager.init` (which falls back to a default) but from
+`on_spawn_points_generated` — which a level with no spawn points never
+triggers. So in a hosted hub `SpecialsPacing._template` is permanently nil.
+
+Vanilla never dereferences it, because `GameplayInitStepPacing` does run in the
+hub and `PacingManager.on_gameplay_post_init` sets
+`_disabled = not main_path_available` — verified live: `is_main_path_available()`
+returns false in a hosted hub, so pacing starts out correctly disabled.
+
+Something then switches it back on. **Will of the Emperor** does, writing the
+field directly rather than through `set_enabled`:
+
+```lua
+elseif not (is_shooting_range or is_prologue) then
+	Managers.state.pacing._disabled = false
+```
+
+A hosted hub is neither of those, so pacing runs and specials pacing dies on the
+nil template roughly 40 seconds in. Not a bug on its side — nothing could host
+the hub before this mod existed. (It leaves no DMF hook log line either, since
+it is a direct field write, which makes it invisible in a crash log's hook list.)
+
+That write lives in WotE's `mod.update`, and it fires **even when the mod is
+switched off**: DMF's `mods_update_event` iterates every loaded mod and calls
+`update` with no `is_enabled()` check (`dmf/modules/core/events.lua`), and WotE
+does not check for itself. Its `is_client_map()` is true for
+`host_type() == "singleplay"`, which a hosted hub is. So in the solo hub the
+flag is being set back to `false` *every frame*, whether or not the mod appears
+enabled — which is why pacing reads as enabled in sessions where WotE was never
+turned on.
+
+This is also what made **reloading mods crash the game**: reload tears every
+hook down and re-applies it, and with pacing force-enabled every frame, the raw
+`SpecialsPacing.update` ran in the gap and hit the nil template.
+
+Three guards, in order of how much weight they carry:
+
+- **`specials_pacing._disabled = true`** — the load-bearing one, and deliberately
+  a write to *game state* rather than another hook. `SpecialsPacing.update`
+  checks its own `_disabled` before it ever reads `_template`, so once set, the
+  engine protects itself even in a frame where our hooks are absent. Nothing
+  else writes this flag (WotE writes the *manager's*), so it is uncontested and
+  survives a mod reload.
+- `set_enabled(false)` on the manager, at `PacingManager.init` and re-asserted
+  each frame. Clean when uncontested; a per-frame ping-pong when WotE is loaded.
+  Harmless either way now that specials is disabled independently.
+- A nil-template early-out on `SpecialsPacing.update`. Verified live catching the
+  real crash configuration, but it only holds while our hooks are installed —
+  hence the state write above.
+
+## Out-of-bounds despawns
+
+An out-of-bounds despawn is terminal in the hub.
+`PlayerUnitSpawnManager._on_player_soft_oob` calls `despawn_player_safe`, and
+nothing puts the player back: respawn is gated on `self._settings.respawn` in
+`game_mode_coop_complete_objective`, and the hub game mode settings have no
+respawn block. You stay unitless until you leave the hub — and every hub view
+that assumes a live player unit then crashes on open. `HavocPlayView` dies
+dereferencing `player_unit_spawn:owner(nil)`, which reads as a random crash when
+opening a terminal but is in fact deterministic once the unit is gone.
+
+Hosting is why this reaches us at all — the OOB check runs on the server, which
+in a public hub is not this machine. So the despawn is suppressed, but **only in
+a hub we host**; missions keep vanilla behaviour, where the despawn matters and
+respawning actually works.
+
+Trade-off: nothing rescues a player who is genuinely below the map. If that ever
+matters more than the crash, the alternative is respawning at a hub spawn point
+instead of suppressing.
+
+`/solohub` reports whether the player unit is present, which is the fast way to
+tell this state apart from an unrelated crash.
+
+## Character switching (archetype changes)
+
+A mod that swaps characters in the hub — InstantCharacterChange — calls
+`player:set_profile()` directly. Against a real hub server that is harmless:
+local data, and the server owns spawning. In a hub we host, we *are* the server,
+so `PackageSynchronizerHost` reacts and starts loading/unloading item packages
+that nothing sequenced. That is the best candidate for the engine crash seen
+after an in-hub character switch — no Lua error, no frame to catch; ICC's own
+notes describe a native refcount assertion from `set_profile` racing package
+loads.
+
+The game has a supported path, and ICC already uses it in the Psykhanium:
+
+```
+ProfileSynchronizerHost:override_singleplay_profile
+  -> set_profile
+  -> PackageSynchronizerHost despawns the unit, loads the new class' packages,
+     respawns on the spot
+```
+
+No level reload, no loading screen. ICC gates it on a game-mode allowlist
+(`training_grounds` / `shooting_range`) that predates hosted hubs existing, so
+our hub misses it despite passing the check that actually matters — a non-nil
+`synchronizer_host`, i.e. being the host. Widening that gate would be a small
+upstream fix.
+
+Rather than wait for it, an archetype-changing `set_profile` on the local player
+in our hub is routed into `override_singleplay_profile` with the same profile.
+Same destination, no loading screen, and you visibly become the new class —
+which ICC cannot achieve in a public hub at all. Nothing here reads ICC's
+internals, so any mod doing the same thing gets the same routing.
+Same-archetype `set_profile` calls — every loadout and talent edit — pass
+through untouched.
+
+Verified working (0.1.5): four consecutive archetype swaps in the hub, each
+completing in 175–850 ms of package sync with no Lua error and no engine crash.
+The hub's own unit template and third-person camera turned out not to be a
+problem. The visible "load screen" is the package sync window, not a reload.
+
+If it ever does misbehave, the fallback is forcing a hub reload on an armed
+switch — ICC's `boot_singleplayer_session` hook then applies the swap in its own
+documented safe window.
+
 ## Settings
 
 - **Private Mourningstar** (default on) — the main toggle.
@@ -136,22 +269,31 @@ overwrite an existing zip.
 
 ## Status
 
-Confirmed working in-game (2026-08-06): entering the private Mourningstar from
-character select, starting missions from it, and party invites.
+Tested in-game as of 0.1.3 (2026-08-07), all working:
 
-The "team mate not available" bug on the mission board was found here — see the
-Presence section; it needed the `evaluate_presence` hook to fix.
+- Entering the private Mourningstar from character select
+- Starting missions from it, and party invites
+- Returning after a mission (the "Also after missions" path)
+- Psykhanium in and out — no double-boot despite
+  `TrainingGroundsOptionsView._start_training_grounds` booting its own
+  singleplayer session
+- Group-up vote — lands in the party's hub server rather than reloading our own
+- The `specials_pacing` crash, including a mod reload while standing in the hub,
+  which is what it took to catch the difference between a hook guard and a game
+  state write
+- Character switching in the hub via InstantCharacterChange (0.1.5) — four
+  archetype swaps, each a sub-second package sync, no crash
 
-## Still to test
+Not yet exercised: the out-of-bounds despawn suppression (0.1.4), which needs
+someone to deliberately go out of bounds in the hub.
 
-1. **Group-up vote** — accept one from the solo hub and confirm you land in the
-   party's hub server rather than reloading your own. With debug logging on this
-   prints "Group-up vote or equivalent: joining the party's hub server".
-2. **Psykhanium in and out** — `TrainingGroundsOptionsView._start_training_grounds`
-   already boots its own singleplayer session; make sure coming back does not
-   double-boot.
-3. **Hub odds and ends** — cutscene and interaction flow, contracts, the AFK
-   check (`afk_check.location = "hub"`), anything gating on `is_social_hub`.
+Two bugs were found by testing rather than by reading the source, and both are
+worth knowing about before changing anything here: the mission board's "team
+mate not available" (see Presence) and the pacing crash (see Pacing). Neither
+was predictable from the session/mechanism code alone.
 
-Likely failure mode if the mechanism switch is mistimed: stuck on the loading
-screen with `is_stranded` in the log, dropping back to character select.
+Not specifically exercised: the AFK check (`afk_check.location = "hub"`) and
+anything else gating on `is_social_hub`.
+
+Likely failure mode if the mechanism switch is ever mistimed: stuck on the
+loading screen with `is_stranded` in the log, dropping back to character select.
