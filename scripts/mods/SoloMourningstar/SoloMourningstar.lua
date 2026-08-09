@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.1.5"
+mod.version = "0.1.8"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -116,6 +116,97 @@ local function _keep_pacing_disabled()
 	end
 end
 
+-- Your own player must not be flagged remote in a hub we host.
+--
+-- ArtificialLatency fakes latency by setting `player.remote = true` on the
+-- local player so the server lag-compensates you, gated on nothing but
+-- `game_session:is_server()`. In vanilla that means the Psykhanium or a solo
+-- mission -- combat sandboxes. A hosted hub satisfies it too, and hub UI
+-- identifies your player by checking `remote`, so flagging yourself remote
+-- makes that code conclude there is no local player and the menu buttons stop
+-- drawing.
+--
+-- Cleared rather than prevented, for the same reason as the pacing re-assert:
+-- the write lands from another mod's own state-change callback, after ours.
+-- Lag compensation only affects hit registration, and the hub has no combat,
+-- so nothing of value is lost by pinning this in the hub alone -- missions and
+-- the Psykhanium are untouched.
+-- Shared by the frame-level clear and the owner() hook further down, so the
+-- explanation is logged once however it first fires.
+local _warned_cleared_remote = false
+
+local function _keep_local_player_local()
+	if not _in_solo_hub() then
+		return
+	end
+
+	local player = Managers.player:local_player_safe(1)
+
+	if not player or not player.remote then
+		return
+	end
+
+	player.remote = nil
+
+	if not _warned_cleared_remote then
+		_warned_cleared_remote = true
+
+		mod:info("Cleared a 'remote' flag on the local player in the solo hub (it hides the hub UI)")
+	end
+end
+
+-- Better than clearing: stop ArtificialLatency writing the flag at all.
+--
+-- Both of its write paths early-out on its own cached setting being zero --
+-- set_player_props then takes the branch that actively clears the flag, and the
+-- owner() hook passes straight through. Holding that cache at zero while we are
+-- in the hub means nothing is ever written.
+--
+-- Worth doing rather than relying on the clears alone, because the clears are
+-- always one step behind at the worst moment: set_player_props fires from that
+-- mod's on_game_state_changed as gameplay is entered, which is when the hub
+-- builds its UI, so the button code can read the flag before our next frame.
+-- `_in_solo_hub()` is already true during loading, so the cache is zero before
+-- that callback runs.
+--
+-- The restore reads their own setting rather than a value we remembered, so a
+-- latency change made while in the hub is not clobbered on the way out. This is
+-- the one place the mod reaches into another mod's internals; the generic
+-- clears stay as the mod-agnostic net, and cover anything else that flags the
+-- local player remote.
+local _al_suppressed = false
+
+local function _hold_artificial_latency_off()
+	local artificial_latency = get_mod("ArtificialLatency")
+	local settings = artificial_latency and artificial_latency.settings
+
+	if type(settings) ~= "table" then
+		return
+	end
+
+	if _in_solo_hub() then
+		if settings.al_ms ~= 0 then
+			settings.al_ms = 0
+
+			if not _al_suppressed then
+				_al_suppressed = true
+
+				mod:info("Holding ArtificialLatency at 0 ms while in the solo hub (its remote flag hides the hub UI)")
+			end
+		end
+	elseif _al_suppressed then
+		_al_suppressed = false
+
+		local ok, value = pcall(function ()
+			return artificial_latency:get("al_ms")
+		end)
+
+		if ok and value then
+			settings.al_ms = value
+		end
+	end
+end
+
 -- Replaces the hub-server client boot with a local one. Returns the session
 -- object, matching what party_immaterium_hot_join_hub_server returns.
 local function _boot_solo_hub(session_manager)
@@ -184,6 +275,8 @@ end)
 -- session is established -- via rpc_set_mechanism from the hub server.
 mod:hook_safe(CLASS.MultiplayerSessionManager, "update", function (self, dt)
 	_keep_pacing_disabled()
+	_hold_artificial_latency_off()
+	_keep_local_player_local()
 
 	if not _pending_session then
 		return
@@ -322,6 +415,43 @@ mod:hook(SpecialsPacing, "update", function (func, self, ...)
 	end
 
 	return func(self, ...)
+end)
+
+-- The frame-level clear above is not enough on its own: ArtificialLatency also
+-- re-applies the flag from its own hook on PlayerUnitSpawnManager.owner, which
+-- the game calls many times a frame (HUD, UI, teleports, damage code), so a
+-- once-per-frame clear loses the race.
+--
+-- DMF runs hook chains newest-first and mods hook in load order, so this hook --
+-- registered by the last mod in the load order -- wraps theirs: call through,
+-- let them write the flag, then clear it before the caller sees the result.
+-- Ordered cheaply because owner() is a hot path: the flag test rejects almost
+-- every call, and the peer test rejects genuine remote players in missions
+-- before the more expensive solo-hub check runs.
+mod:hook(PlayerUnitSpawnManager, "owner", function (func, self, unit)
+	local owner = func(self, unit)
+
+	if not owner or not owner.remote then
+		return owner
+	end
+
+	if not owner.peer_id or owner:peer_id() ~= Network.peer_id() then
+		return owner
+	end
+
+	if not _in_solo_hub() then
+		return owner
+	end
+
+	owner.remote = nil
+
+	if not _warned_cleared_remote then
+		_warned_cleared_remote = true
+
+		mod:info("Cleared a 'remote' flag on the local player in the solo hub (it hides the hub UI)")
+	end
+
+	return owner
 end)
 
 -- Out-of-bounds despawns are terminal in the hub. `_on_player_soft_oob` calls

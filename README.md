@@ -234,6 +234,41 @@ If it ever does misbehave, the fallback is forcing a hub reload on an armed
 switch — ICC's `boot_singleplayer_session` hook then applies the swap in its own
 documented safe window.
 
+## Artificial latency (hub UI disappearing)
+
+ArtificialLatency does not delay packets — it fakes latency by setting
+`player.remote = true` on your own player so the server lag-compensates you.
+Its gate is only `game_session:is_server()`, which in vanilla means the
+Psykhanium or a solo mission. A hosted hub satisfies it too, and hub UI
+identifies your player by checking `remote`, so flagging yourself remote makes
+that code conclude there is no local player and the menu buttons stop drawing.
+
+Handled in three layers, because clearing alone is always one step behind at the
+worst moment — `set_player_props` fires from that mod's `on_game_state_changed`
+as gameplay is entered, which is exactly when the hub builds its UI:
+
+- **Prevention.** Both of its write paths early-out when its own cached
+  `al_ms` is zero (`set_player_props` then takes the branch that actively clears
+  the flag). That cache is held at zero while in the solo hub, so nothing is
+  ever written. `_in_solo_hub()` is true during loading, before the state-change
+  callback runs. The restore on leaving reads their setting rather than a
+  remembered value, so a latency change made in the hub is not clobbered.
+- **An outer `owner()` hook.** DMF chains hooks newest-first and mods hook in
+  load order, so ours (last in the load order) wraps theirs: call through, then
+  clear before the caller sees the result. Covers the case where the cache is
+  non-zero for a frame.
+- **A frame-level clear**, for anything reading `player.remote` without going
+  through `owner()`.
+
+The prevention layer is the one place this mod reaches into another mod's
+internals. The other two are mod-agnostic and cover anything else that flags the
+local player as remote.
+
+Lag compensation only affects hit registration and the hub has no combat, so
+suppressing it there costs nothing; missions and the Psykhanium are untouched.
+
+Upstream, the fix is a game-mode check alongside the `is_server()` gate.
+
 ## Settings
 
 - **Private Mourningstar** (default on) — the main toggle.
