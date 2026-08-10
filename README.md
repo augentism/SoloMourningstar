@@ -269,6 +269,48 @@ suppressing it there costs nothing; missions and the Psykhanium are untouched.
 
 Upstream, the fix is a game-mode check alongside the `is_server()` gate.
 
+## First person Mourningstar (experimental, off by default)
+
+The hub player is not a stripped-down mission player by accident — it uses a
+different unit template. `player_character_social_hub` and `player_character`
+differ by exactly 13 extensions, all combat: `SlotExtension` (which minion
+target selection crashes without), health, toughness, aim, attack intensity,
+mood, music, smart tag, and their husk counterparts. Patching each crash site as
+it surfaced would have been a long road — swapping the template restores all of
+them at once.
+
+Almost all of it is *removing* the hub's overrides, since the mission game mode
+sets none of them:
+
+| Field | Hub | Mission |
+| --- | --- | --- |
+| `player_unit_template_name_override` | `player_character_social_hub` | unset → `player_character` |
+| `default_inventory` / `default_wielded_slot_name` | unarmed only | unset → real loadout |
+| `use_third_person_hub_camera` | true | unset |
+| `vaulting_allowed` | false | true |
+| `force_third_person_mode` (mission template) | true | — |
+| `gameplay_modifiers` (mission template) | `unkillable`, `invulnerable` | — |
+
+Written before the session boots, because the game mode and mission template are
+read during the load that follows — so toggling the setting takes effect on the
+next hub load. The stock values are restored whenever we are heading for a
+public hub, so a real hub server is never loaded with combat settings patched in.
+
+There is no respawn in the hub (no `respawn` block in the game mode, same as the
+Psykhanium), so dying means going back to character select and loading in again.
+That is accepted behaviour rather than an oversight.
+
+`hud_elements` is cleared too, so the hub gets the full combat HUD — health,
+toughness, buffs, stamina, ammo, damage indicator — instead of the hub's
+cut-down set.
+
+**Known issue: do not spawn a Beast of Nurgle.** Being eaten crashes the game
+(engine crash, no Lua error, so nothing to catch). The same enemy consuming you
+in the Psykhanium is fine, which rules out the enemy itself and points at a
+remaining hub/Psykhanium difference. Restoring the full combat HUD, the first
+suspect, did not fix it. Unexamined deltas: the level's own spawn and respawn
+infrastructure, and `is_social_hub`.
+
 ## Settings
 
 - **Private Mourningstar** (default on) — the main toggle.

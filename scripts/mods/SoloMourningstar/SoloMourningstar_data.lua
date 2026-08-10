@@ -21,6 +21,13 @@ return {
 				tooltip = "solo_hub_after_mission_tooltip",
 			},
 			{
+				setting_id = "first_person_hub",
+				type = "checkbox",
+				default_value = false,
+				title = "first_person_hub",
+				tooltip = "first_person_hub_tooltip",
+			},
+			{
 				setting_id = "debug_logging",
 				type = "checkbox",
 				default_value = false,

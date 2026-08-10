@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.1.8"
+mod.version = "0.2.2"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -25,7 +25,9 @@ mod.version = "0.1.8"
 -- session is live. Everything downstream is stock -- MechanismHub loads the
 -- level itself and StateLoading drives it from there.
 
+local GameModeSettings = require("scripts/settings/game_mode/game_mode_settings")
 local MatchmakingConstants = require("scripts/settings/network/matchmaking_constants")
+local Missions = require("scripts/settings/mission/mission_templates")
 local PacingManager = require("scripts/managers/pacing/pacing_manager")
 local PartyConstants = require("scripts/settings/network/party_constants")
 local PlayerUnitSpawnManager = require("scripts/managers/player/player_unit_spawn_manager")
@@ -207,6 +209,87 @@ local function _hold_artificial_latency_off()
 	end
 end
 
+-- First person Mourningstar (off by default): make the hub a place you can fight in.
+--
+-- The hub player is not a stripped-down version of the mission player by
+-- accident -- it uses a different unit template, and the two differ by exactly
+-- the 13 extensions that make combat work: SlotExtension (which minion target
+-- selection crashes without), health, toughness, aim, attack intensity, mood,
+-- music and smart tag, plus their husk counterparts. Patching each crash site
+-- as it appears would be a long road; swapping the template restores all of
+-- them at once.
+--
+-- Nearly all of this is *removing* the hub's overrides rather than inventing
+-- values: the mission game mode sets no unit template override (so it gets
+-- `player_character`), no default inventory, no wielded-slot override, and
+-- allows vaulting. The mission template's third-person lock and its
+-- unkillable/invulnerable modifiers come off too.
+--
+-- Death has no respawn here -- the hub game mode has no `respawn` block, same
+-- as the Psykhanium -- so dying means returning to character select and coming
+-- back in. That is the accepted behaviour, not an oversight.
+local _first_person_hub_applied = nil
+
+local _hub_defaults = {
+	player_unit_template_name_override = GameModeSettings.hub.player_unit_template_name_override,
+	default_wielded_slot_name = GameModeSettings.hub.default_wielded_slot_name,
+	default_inventory = GameModeSettings.hub.default_inventory,
+	use_third_person_hub_camera = GameModeSettings.hub.use_third_person_hub_camera,
+	starting_character_state_name = GameModeSettings.hub.starting_character_state_name,
+	default_player_orientation = GameModeSettings.hub.default_player_orientation,
+	vaulting_allowed = GameModeSettings.hub.vaulting_allowed,
+}
+
+local _mission_defaults = {
+	force_third_person_mode = Missions.hub_ship.force_third_person_mode,
+	gameplay_modifiers = Missions.hub_ship.gameplay_modifiers,
+	hud_elements = Missions.hub_ship.hud_elements,
+}
+
+-- Written before the session boots, because the game mode and mission template
+-- are read during the load that follows. Changing the setting therefore takes
+-- effect on the next hub load, not immediately.
+local function _set_first_person_hub(enabled)
+	if _first_person_hub_applied == enabled then
+		return
+	end
+
+	_first_person_hub_applied = enabled
+
+	local hub = GameModeSettings.hub
+	local mission = Missions.hub_ship
+
+	if enabled then
+		hub.player_unit_template_name_override = nil
+		hub.default_wielded_slot_name = nil
+		hub.default_inventory = nil
+		hub.use_third_person_hub_camera = nil
+		hub.starting_character_state_name = nil
+		hub.default_player_orientation = nil
+		hub.vaulting_allowed = true
+		mission.force_third_person_mode = nil
+		mission.gameplay_modifiers = nil
+
+		-- The hub HUD has no health bar, buffs, stamina, ammo or damage
+		-- indicator. hud_loader falls back to hud_elements_player when the
+		-- mission template does not name a list, so clearing it gives the full
+		-- combat HUD -- same shape as every other field here.
+		mission.hud_elements = nil
+
+		mod:info("First person Mourningstar ON: full player unit template, real loadout, no invulnerability")
+	else
+		for key, value in pairs(_hub_defaults) do
+			hub[key] = value
+		end
+
+		for key, value in pairs(_mission_defaults) do
+			mission[key] = value
+		end
+
+		_log("First person Mourningstar OFF: stock hub settings restored")
+	end
+end
+
 -- Replaces the hub-server client boot with a local one. Returns the session
 -- object, matching what party_immaterium_hot_join_hub_server returns.
 local function _boot_solo_hub(session_manager)
@@ -215,6 +298,8 @@ local function _boot_solo_hub(session_manager)
 	end
 
 	session_manager:clear_session_boot()
+
+	_set_first_person_hub(mod:get("first_person_hub") == true)
 
 	_pending_session = session_manager:boot_singleplayer_session()
 
@@ -228,6 +313,10 @@ end
 -- Vanilla routes both to _find_available_immaterium_session.
 mod:hook(CLASS.MultiplayerSessionManager, "find_available_session", function (func, self)
 	if not _solo_enabled() then
+		-- Heading for a public hub: it must never be loaded with the combat
+		-- settings patched in.
+		_set_first_person_hub(false)
+
 		return func(self)
 	end
 
@@ -261,6 +350,9 @@ mod:hook(CLASS.MultiplayerSessionManager, "party_immaterium_hot_join_hub_server"
 	-- would swap the live session out from under a hub we are already in.
 	if _in_solo_hub() then
 		_log("Group-up vote or equivalent: joining the party's hub server")
+
+		-- Same reason as above: a real hub server must load stock.
+		_set_first_person_hub(false)
 
 		return func(self)
 	end
