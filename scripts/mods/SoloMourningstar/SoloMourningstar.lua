@@ -25,6 +25,7 @@ mod.version = "0.2.4"
 -- session is live. Everything downstream is stock -- MechanismHub loads the
 -- level itself and StateLoading drives it from there.
 
+local DangerSettings = require("scripts/settings/difficulty/danger_settings")
 local GameModeSettings = require("scripts/settings/game_mode/game_mode_settings")
 local MatchmakingConstants = require("scripts/settings/network/matchmaking_constants")
 local Missions = require("scripts/settings/mission/mission_templates")
@@ -33,6 +34,7 @@ local PartyConstants = require("scripts/settings/network/party_constants")
 local PlayerUnitSpawnManager = require("scripts/managers/player/player_unit_spawn_manager")
 local PresenceSettings = require("scripts/settings/presence/presence_settings")
 local SpecialsPacing = require("scripts/managers/pacing/specials_pacing/specials_pacing")
+local TrainingGroundsSoundEvents = require("scripts/settings/training_grounds/training_grounds_sound_events")
 
 local HOST_TYPES = MatchmakingConstants.HOST_TYPES
 local PartyState = PartyConstants.State
@@ -757,6 +759,80 @@ mod:hook(CLASS.CompanionInteractionsManager, "companion_is_in_position_for_inter
 
 		return func(self, companion_owner_unit, companion_unit)
 	end)
+
+-- Entering the Psykhanium from a solo hub dies on vanilla's `reset_seed`.
+--
+-- TrainingGroundsOptionsView._start_training_grounds boots a singleplayer
+-- session and then calls `Managers.connection:reset_seed()` on the connection it
+-- assumes that boot just rebuilt. Hosting the hub means Realms already has a
+-- live listen host, so its `replace_singleplayer_boot` takes the reuse branch
+-- and hands the running session straight back -- deliberately, because a shared
+-- Psykhanium is a Realms feature, not an accident -- and the connection is never
+-- rebuilt. `reset_seed` is not on it, so the Start button dies with "attempt to
+-- call method 'reset_seed' (a nil value)".
+--
+-- Realms already supports the move we actually want: `queue_mission_transition`
+-- swaps the map on the session that is already running, so anyone in the hub
+-- comes along and no vanilla code gets to assume a fresh connection. Take that
+-- route only when every part of it is true and leave vanilla alone otherwise --
+-- without a Realms host the stock path is correct and must not be touched.
+local function _realms_host()
+	local realms = get_mod("Realms")
+
+	if not realms or not realms:is_enabled() or type(realms.queue_mission_transition) ~= "function" then
+		return nil
+	end
+
+	local session = realms._session
+
+	-- `is_active_host` is the same test Realms uses to decide whether to reuse
+	-- the host, so it is also the test for whether vanilla's assumption breaks.
+	if type(session) ~= "table" or type(session.is_active_host) ~= "function" or not session.is_active_host() then
+		return nil
+	end
+
+	return realms
+end
+
+-- String form, not CLASS: the view does not exist until it is first opened, and
+-- DMF holds the hook until it does.
+mod:hook("TrainingGroundsOptionsView", "_start_training_grounds", function (func, self, mechanism_context)
+	local realms = _in_solo_hub() and _realms_host()
+
+	if not realms then
+		return func(self, mechanism_context)
+	end
+
+	-- We are replacing the tail of the vanilla function, so the work it does
+	-- first has to happen here too. The challenge level is the part that
+	-- matters: drop it and the difficulty stepper silently stops doing anything.
+	local difficulty_stepper = self:_element("difficulty_selector")
+	local danger_level = difficulty_stepper and difficulty_stepper:get_current_selected_difficulty() or 1
+	local difficulty_setting = DangerSettings[danger_level]
+
+	mechanism_context.challenge_level = difficulty_setting and difficulty_setting.challenge or 1
+
+	-- Read the level before queueing: the transition begins by taking the
+	-- mechanism out of gameplay.
+	local mission_manager = Managers.state and Managers.state.mission
+	local level = mission_manager and mission_manager:mission_level()
+	local ok, queued, queue_error = pcall(realms.queue_mission_transition, mod, mechanism_context)
+
+	if not ok or not queued then
+		_log("Realms would not take the Psykhanium transition ("
+			.. tostring(ok and queue_error or queued) .. "), using the vanilla path")
+
+		return func(self, mechanism_context)
+	end
+
+	-- Only once the transition is accepted, so falling back cannot fire these
+	-- twice.
+	Managers.ui:play_2d_sound(TrainingGroundsSoundEvents.tg_hub_button)
+
+	if level then
+		Level.trigger_event(level, "training_grounds_started")
+	end
+end)
 
 mod:command("solohub", mod:localize("command_description"), function ()
 	local session_manager = Managers.multiplayer_session
