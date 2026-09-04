@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.2.2"
+mod.version = "0.2.4"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -394,10 +394,16 @@ mod:hook_safe(CLASS.MultiplayerSessionManager, "update", function (self, dt)
 		return
 	end
 
-	if mechanism_manager:mechanism_name() == HUB_MECHANISM then
-		return
-	end
-
+	-- Deliberately unconditional, including when the mechanism is already "hub".
+	-- The name cannot tell a healthy hub mechanism from a stale one parked in
+	-- MechanismHub's terminal `client_wait_for_server` state, which is where
+	-- leaving the hub for a mission puts it (`client_exit_gameplay` fires from
+	-- MultiplayerSessionManager.update). If that join then fails, the mechanism
+	-- it was waiting for never arrives and its wanted_transition returns false
+	-- forever -- StateLoading spins on "Communicating with Fatshark backend".
+	-- Skipping the change there left the dead mechanism in charge of a session
+	-- we had just booted. A fresh session always gets a fresh mechanism;
+	-- change_mechanism deletes the old one first, so this is safe to repeat.
 	_log("Solo hub session ready, changing to the hub mechanism as owner")
 	mechanism_manager:change_mechanism(HUB_MECHANISM, {})
 end)
@@ -659,6 +665,98 @@ mod:hook(CLASS.HumanPlayer, "set_profile", function (func, self, profile)
 	mod:info("override_singleplay_profile failed; skipping the in-place swap so it cannot crash"
 		.. " (the switch stays armed for your next travel)")
 end)
+
+-- Block creature_spawner (and anything routed through it) from spawning a mob
+-- in the solo hub while the player is not in first-person combat mode.
+--
+-- The social-hub player unit has no slot_system extension. When a spawned
+-- minion picks the player as a new target, MinionTargetSelection.occupied_slots_weight
+-- indexes that missing extension and hard-crashes the game
+-- (scripts/utilities/minion_target_selection.lua). Players kept triggering the
+-- spawn keybind with chat open -- creature_spawner's own guard only blocks when
+-- chat has input FOCUS, not merely when the chat box is visible -- and crashing.
+--
+-- First-person Mourningstar swaps in the full mission template, which has
+-- slot_system (and the other 12 combat extensions), so spawning is safe there.
+-- Gating on the extension actually being present, rather than on our setting,
+-- is correct regardless of how the player got here (the setting only applies on
+-- the next hub load).
+local function _player_can_be_targeted_safely()
+	local player = Managers.player and Managers.player:local_player_safe(1)
+	local unit = player and player.player_unit
+
+	if not unit or not Unit.alive(unit) then
+		return false
+	end
+
+	return ScriptUnit.has_extension(unit, "slot_system") ~= nil
+end
+
+local _warned_blocked_spawn = false
+
+mod.on_all_mods_loaded = function ()
+	local creature_spawner = get_mod("creature_spawner")
+
+	if not creature_spawner or type(creature_spawner.spawn_breed_at_cursor) ~= "function" then
+		return
+	end
+
+	mod:hook(creature_spawner, "spawn_breed_at_cursor", function (func, self, breed_name)
+		if _in_solo_hub() and not _player_can_be_targeted_safely() then
+			if not _warned_blocked_spawn then
+				_warned_blocked_spawn = true
+
+				mod:info("Blocked a creature_spawner spawn in the solo hub: the hub character has no slot_system extension and a targeting minion would crash the game. Turn on First person Mourningstar to fight.")
+			end
+
+			mod:echo("[Solo Mourningstar] Enable First person Mourningstar to spawn enemies here.")
+
+			return
+		end
+
+		return func(self, breed_name)
+	end)
+
+	mod:info("Guarding creature_spawner spawns in the non-combat solo hub")
+end
+
+-- Petting the companion dog crashes in first-person Mourningstar.
+--
+-- The dog's hub interaction plays an animation on the PLAYER unit
+-- (CompanionInteractionsManager.start_interaction_animation ->
+-- AnimationSystem.play_companion_interaction_anim_event ->
+-- Unit.animation_find_variable). The social-hub player template carries that
+-- companion-interaction animation variable; the full combat template that
+-- first-person mode swaps in does not, so the variable lookup hard-crashes.
+--
+-- This is the exact mirror of the spawn guard above. The combat template HAS
+-- slot_system (so it can be targeted and fought); the social template does not.
+-- So one signal gates both: block spawning when there is no slot_system (social
+-- template can't be targeted), block dog-petting when there IS (combat template
+-- can't play the companion animation).
+--
+-- Blocked at the host-side "is the dog in position to start" gate, before any
+-- animation is attempted, so nothing half-starts. In solo we are always host and
+-- the only player, so this is the only path that reaches the crash; the remote
+-- client rpc paths never fire.
+local _warned_blocked_companion = false
+
+mod:hook(CLASS.CompanionInteractionsManager, "companion_is_in_position_for_interaction",
+	function (func, self, companion_owner_unit, companion_unit)
+		if _in_solo_hub()
+			and companion_owner_unit
+			and ScriptUnit.has_extension(companion_owner_unit, "slot_system") then
+			if not _warned_blocked_companion then
+				_warned_blocked_companion = true
+
+				mod:info("Blocked a companion (dog) hub interaction in the first-person solo hub: the combat player template has no companion-interaction animation and the petting animation would crash. Petting works in the normal third-person Mourningstar.")
+			end
+
+			return
+		end
+
+		return func(self, companion_owner_unit, companion_unit)
+	end)
 
 mod:command("solohub", mod:localize("command_description"), function ()
 	local session_manager = Managers.multiplayer_session

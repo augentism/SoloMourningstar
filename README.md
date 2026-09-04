@@ -325,8 +325,9 @@ presence.
 
 ## Releasing
 
-```
-python .claude/skills/darktide-mod/scripts/release_mod.py SoloMourningstar
+```bash
+nix develop ./nix --command python3 \
+    .claude/skills/darktide-mod/scripts/release_mod.py SoloMourningstar
 ```
 
 Writes `releases/SoloMourningstar-<version>.zip`. The version is `mod.version`
