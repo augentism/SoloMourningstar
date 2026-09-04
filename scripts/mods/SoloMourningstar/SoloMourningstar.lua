@@ -776,19 +776,36 @@ mod:hook(CLASS.CompanionInteractionsManager, "companion_is_in_position_for_inter
 -- comes along and no vanilla code gets to assume a fresh connection. Take that
 -- route only when every part of it is true and leave vanilla alone otherwise --
 -- without a Realms host the stock path is correct and must not be touched.
+-- Returns the Realms mod when it is hosting, or nil plus the reason it is not.
+-- The reason is only for the log, but this hook is silent when it declines and
+-- a wrong guard here looks exactly like the hook never running at all.
 local function _realms_host()
 	local realms = get_mod("Realms")
 
-	if not realms or not realms:is_enabled() or type(realms.queue_mission_transition) ~= "function" then
-		return nil
+	if not realms then
+		return nil, "Realms not installed"
+	end
+	if not realms:is_enabled() then
+		return nil, "Realms disabled"
+	end
+	if type(realms.queue_mission_transition) ~= "function" then
+		return nil, "Realms has no queue_mission_transition"
 	end
 
 	local session = realms._session
 
+	if type(session) ~= "table" or type(session.is_active_host) ~= "function" then
+		return nil, "Realms session API missing"
+	end
+
 	-- `is_active_host` is the same test Realms uses to decide whether to reuse
-	-- the host, so it is also the test for whether vanilla's assumption breaks.
-	if type(session) ~= "table" or type(session.is_active_host) ~= "function" or not session.is_active_host() then
-		return nil
+	-- the host, so it is exactly the test for whether vanilla's assumption
+	-- breaks. Deliberately the ONLY condition: `_in_solo_hub()` looks like the
+	-- obvious extra guard and is wrong here, because once Realms installs its
+	-- listen host the session reports host_type "player" rather than
+	-- "singleplay", so that helper is false throughout the hub we are hosting.
+	if not session.is_active_host() then
+		return nil, "Realms is not hosting"
 	end
 
 	return realms
@@ -797,9 +814,11 @@ end
 -- String form, not CLASS: the view does not exist until it is first opened, and
 -- DMF holds the hook until it does.
 mod:hook("TrainingGroundsOptionsView", "_start_training_grounds", function (func, self, mechanism_context)
-	local realms = _in_solo_hub() and _realms_host()
+	local realms, why = _realms_host()
 
 	if not realms then
+		_log("Psykhanium: leaving the vanilla path alone (" .. tostring(why) .. ")")
+
 		return func(self, mechanism_context)
 	end
 
