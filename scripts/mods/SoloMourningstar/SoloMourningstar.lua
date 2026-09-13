@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.2.4"
+mod.version = "0.3.5"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -51,6 +51,21 @@ local function _log(message)
 	if mod:get("debug_logging") then
 		mod:info(message)
 	end
+end
+
+-- mod:info re-runs its message through string.format, so a literal % in
+-- anything we did not write ourselves -- an engine error string, a path --
+-- throws "invalid option '%'". Escape before logging foreign text.
+local function _escaped(value)
+	return (tostring(value):gsub("%%", "%%%%"))
+end
+
+-- Unconditional, unlike _log. Every line this writes is one we need to be able
+-- to read in a bug reporter's console log, and debug_logging is off for
+-- everyone but us -- which is exactly why the first round of reports could not
+-- be told apart by build or by which entry path the player took.
+local function _trace(message)
+	mod:info("[trace] " .. message)
 end
 
 local function _solo_enabled()
@@ -294,8 +309,10 @@ end
 
 -- Replaces the hub-server client boot with a local one. Returns the session
 -- object, matching what party_immaterium_hot_join_hub_server returns.
-local function _boot_solo_hub(session_manager)
+local function _boot_solo_hub(session_manager, entry)
 	if _pending_session and not _pending_session:is_dead() then
+		_trace("Solo hub boot already in flight, reusing it (entry: " .. tostring(entry) .. ")")
+
 		return _pending_session
 	end
 
@@ -305,16 +322,70 @@ local function _boot_solo_hub(session_manager)
 
 	_pending_session = session_manager:boot_singleplayer_session()
 
-	_log("Booting private Mourningstar (singleplayer session)")
+	local mechanism_manager = Managers.mechanism
+
+	_trace("Booting private Mourningstar (singleplayer session)"
+		.. " -- entry: " .. tostring(entry)
+		.. ", mechanism: " .. tostring(mechanism_manager and mechanism_manager:mechanism_name())
+		.. ", host channel: " .. tostring(mechanism_manager and mechanism_manager._mechanism_host_channel))
 
 	return _pending_session
+end
+
+-- The reasons MechanismLeftSession enumerates (mechanism_left_session.lua:23-38)
+-- that mean a mission just ended or was abandoned. Everything else arriving
+-- through left_session is not a mission -- notably "leave_to_hub", the
+-- Psykhanium exit -- and stays under solo_hub_on_enter, as does character
+-- select, which passes no reason at all. An unrecognised reason falls the same
+-- way, so a reason Fatshark adds later behaves like the general case.
+local MISSION_EXIT_REASONS = {
+	failed_fetching_session_report = true,
+	leave_mission = true,
+	leave_mission_stay_in_party = true,
+	session_completed = true,
+	skip_end_of_round = true,
+}
+
+-- Read the reason rather than hooking the exit paths.
+--
+-- find_available_session is called from inside MechanismLeftSession:wanted_transition,
+-- so by the time we get here the left-session mechanism is installed and its
+-- init has already stored self._context.left_session_reason. One read covers
+-- every route into the hub at once -- which matters, because enumerating exit
+-- paths and missing one is the exact bug this is fixing.
+local function _left_session_reason()
+	local mechanism_manager = Managers.mechanism
+	local mechanism = mechanism_manager and mechanism_manager._mechanism
+	local context = mechanism and mechanism._context
+
+	return context and context.left_session_reason
 end
 
 -- Character select "Enter Mourningstar", and every return-to-hub that goes
 -- through MechanismLeftSession (leaving a mission, leaving the Psykhanium).
 -- Vanilla routes both to _find_available_immaterium_session.
+--
+-- solo_hub_after_mission used to gate only the party_immaterium_hot_join_hub_server
+-- hook below, which is one of *two* ways out of the end screen. The timer and
+-- the player-summary continue fire game_score_done and land there; the main
+-- Continue button instead calls multiplayer_session:leave("skip_end_of_round")
+-- (end_view.lua:561-571), tearing the session down and returning to the hub
+-- through MechanismLeftSession -- i.e. through here, which was gated only on
+-- solo_hub_on_enter. So players who switched "after mission" off still got the
+-- solo hub every time they clicked Continue.
 mod:hook(CLASS.MultiplayerSessionManager, "find_available_session", function (func, self)
-	if not _solo_enabled() then
+	local reason = _left_session_reason()
+	local is_mission_exit = reason ~= nil and MISSION_EXIT_REASONS[reason] == true
+
+	-- The mission-exit branch mirrors the hot-join hook's gate exactly
+	-- (_solo_enabled() *and* solo_hub_after_mission) rather than treating the
+	-- two settings as independent, so this changes nothing except closing the
+	-- ungated path.
+	if not _solo_enabled() or (is_mission_exit and not mod:get("solo_hub_after_mission")) then
+		_trace("Passing find_available_session through to a public hub"
+			.. " (left_session reason: " .. tostring(reason)
+			.. ", mission exit: " .. tostring(is_mission_exit) .. ")")
+
 		-- Heading for a public hub: it must never be loaded with the combat
 		-- settings patched in.
 		_set_first_person_hub(false)
@@ -330,7 +401,7 @@ mod:hook(CLASS.MultiplayerSessionManager, "find_available_session", function (fu
 		return func(self)
 	end
 
-	_boot_solo_hub(self)
+	_boot_solo_hub(self, "find_available_session (left_session reason: " .. tostring(reason) .. ")")
 
 	return CLASS.StateLoading, {}
 end)
@@ -342,6 +413,28 @@ end)
 -- alive at this point).
 mod:hook(CLASS.MultiplayerSessionManager, "party_immaterium_hot_join_hub_server", function (func, self)
 	if not (_solo_enabled() and mod:get("solo_hub_after_mission")) then
+		-- Heading for a public hub, so the combat settings must come back off
+		-- first -- the same reason the branch below and find_available_session
+		-- both do it. This branch did not, and it is the one reached whenever
+		-- solo_hub_after_mission is off.
+		--
+		-- The cost of missing it is not cosmetic. _set_first_person_hub(true)
+		-- clears player_unit_template_name_override on the SHARED
+		-- GameModeSettings.hub, so it applies to every player unit in the hub,
+		-- remote ones included. Left patched in a public Mourningstar, the next
+		-- stranger to hot-join has their husk built from the combat template,
+		-- whose animation state machine carries no hub aim constraint target:
+		--
+		--   spawn_husk_unit -> wield_slot -> set_anim_state_machine
+		--     -> PlayerUnitHubAimExtension.state_machine_changed
+		--     -> HubAimConstraints.init -> animation_find_constraint_target
+		--   "State machine has no constraint target named ... in unit ..."
+		--
+		-- A hard crash inside somebody else's husk spawn, seconds to minutes
+		-- after arriving, with nothing on screen connecting it to a first-person
+		-- setting. Found by tests/ingame/paths.sh row 6, not by a player.
+		_set_first_person_hub(false)
+
 		return func(self)
 	end
 
@@ -359,7 +452,7 @@ mod:hook(CLASS.MultiplayerSessionManager, "party_immaterium_hot_join_hub_server"
 		return func(self)
 	end
 
-	return _boot_solo_hub(self)
+	return _boot_solo_hub(self, "party_immaterium_hot_join_hub_server (after mission)")
 end)
 
 -- The mechanism switch is deferred to here rather than done inside the hooks
@@ -406,8 +499,144 @@ mod:hook_safe(CLASS.MultiplayerSessionManager, "update", function (self, dt)
 	-- Skipping the change there left the dead mechanism in charge of a session
 	-- we had just booted. A fresh session always gets a fresh mechanism;
 	-- change_mechanism deletes the old one first, so this is safe to repeat.
-	_log("Solo hub session ready, changing to the hub mechanism as owner")
+	-- PART 1 of the mission-channel teardown. Parts 2 and 3 are the two
+	-- MechanismManager hooks further down; all three exist for one reason:
+	--
+	--   Taking the hub mechanism after a mission does not close the mission
+	--   server's channel. change_mechanism clears neither
+	--   `_mechanism_host_channel` nor the events registered on that channel
+	--   (mechanism_manager.lua:238-272) -- only MechanismManager.disconnect
+	--   does, and nothing was calling it. So a dedicated server we have walked
+	--   away from stays wired to this client until it times out a minute later.
+	--
+	-- This part closes it at the source, which is the only one of the three that
+	-- removes the condition rather than surviving it.
+	--
+	-- The confirmed consequence of leaving it open is a hard crash: with the
+	-- channel live, rpc_mechanism_event still fires for this client, so the
+	-- server's end-of-round game_score_done is dispatched into MechanismHub,
+	-- which has no such handler -- a nil call inside the RPC dispatcher with no
+	-- pcall above it, ~45s after a mission the player already left. Reproduced
+	-- twice with full dumps (2026-09-08).
+	--
+	-- A latent second consequence, never observed but cheap to close here:
+	-- wanted_transition branches on the same field (mechanism_manager.lua:277-290)
+	-- and with it set calls leave_mechanism() instead of change_mechanism("hub").
+	--
+	-- pcall'd because unregister_channel_events indexes
+	-- _registered_channel_objects with no nil check
+	-- (network_event_delegate.lua), so disconnecting a channel something else
+	-- already tore down would throw. disconnect() nils _mechanism_host_channel
+	-- first -- the part that actually matters -- and the change_mechanism below
+	-- repeats the leave_mechanism it might have skipped, so a partial failure
+	-- still lands somewhere valid.
+	local previous_mechanism = mechanism_manager:mechanism_name()
+	local host_channel = mechanism_manager._mechanism_host_channel
+
+	if host_channel then
+		_trace("Dropping stale mechanism host channel " .. tostring(host_channel)
+			.. " (mechanism " .. tostring(previous_mechanism) .. ") before taking the hub")
+
+		local ok, err = pcall(mechanism_manager.disconnect, mechanism_manager, host_channel)
+
+		if not ok then
+			_trace("Disconnect from channel " .. tostring(host_channel)
+				.. " failed, continuing anyway: " .. _escaped(err))
+		end
+
+		-- Belt and braces: disconnect nils this itself, but if it threw before
+		-- getting there, the wanted_transition branch above is still armed.
+		mechanism_manager._mechanism_host_channel = nil
+	end
+
+	_trace("Solo hub session ready, changing to the hub mechanism as owner"
+		.. " (previous mechanism: " .. tostring(previous_mechanism)
+		.. ", had host channel: " .. tostring(host_channel) .. ")")
 	mechanism_manager:change_mechanism(HUB_MECHANISM, {})
+end)
+
+-- PART 2 of the mission-channel teardown. See PART 1 above the swap.
+--
+-- The backstop for the crash PART 1 is meant to prevent, for the frames where
+-- the channel is still open: between the mission ending and the swap, and after
+-- a PART 1 disconnect that threw inside its pcall.
+--
+-- rpc_mechanism_event does `mechanism[event_name](mechanism)` with no lookup
+-- check, and MechanismHub implements neither game_score_done nor
+-- victory_defeat_done (mechanism_hub.lua has client_exit_gameplay,
+-- all_players_ready and failed_fetching_session_report, and that is all). So an
+-- event arriving from the mission server while the hub mechanism is installed is
+-- a nil call in the RPC dispatcher with no pcall above it. Three quarters of a
+-- minute after a mission the player has already walked away from, which is why
+-- it survived testing: nothing on screen connects the crash to its cause.
+--
+-- Expect this to be silent in a healthy session -- PART 1 unregisters the
+-- channel first, so there is nothing left to drop, and the 2026-09-13 logs show
+-- zero firings. A `[trace] Dropping mechanism event` line in a report means a
+-- channel got past PART 1 and is worth reading closely.
+--
+-- Deliberately not gated on _solo_enabled() or solo_hub_after_mission. The
+-- window this covers is precisely the one where the mod's own state says it is
+-- finished, and dropping an event the installed mechanism cannot handle beats
+-- crashing in every case, ours or not. A nil event_name (an id this build does
+-- not know) falls into the same branch rather than reaching a table index, which
+-- is a second thing vanilla does not check.
+mod:hook(CLASS.MechanismManager, "rpc_mechanism_event", function (func, self, channel_id, event_id)
+	local event_name = self.EVENT_LOOKUP[event_id]
+	local mechanism = self._mechanism
+
+	if not mechanism or type(mechanism[event_name]) ~= "function" then
+		-- _trace, not _log: if this ever fires after 0.3.2 it means a channel
+		-- got past the disconnect above, and that is the first thing we would
+		-- want to see in the reporter's log rather than a silent swallow.
+		_trace("Dropping mechanism event " .. tostring(event_name) .. " from channel "
+			.. tostring(channel_id) .. " -- mechanism " .. tostring(self._mechanism_name)
+			.. " has no handler for it")
+
+		return
+	end
+
+	return func(self, channel_id, event_id)
+end)
+
+-- PART 3 of the mission-channel teardown. See PART 1 above the swap.
+--
+-- LocalDisconnectedState.init (local_disconnected_state.lua:15) calls
+-- Managers.mechanism:disconnect for any channel that finishes dying, gated only
+-- on started_state_sync and never on whether that channel is still the
+-- mechanism host -- and disconnect ends in an unconditional leave_mechanism()
+-- with no comparison against _mechanism_host_channel. So when the abandoned
+-- mission connection reaps itself, 50 to 80 seconds later, it destroys whatever
+-- mechanism is installed at that moment: the hub the player is standing in.
+--
+-- Vanilla is safe only because it never holds a mechanism a dead channel does
+-- not own. We do, from the moment we take the hub while a mission server is
+-- still connected.
+--
+-- Comparing the channel also makes PART 2's proactive disconnect safe: that one
+-- runs while the channel still matches, so it passes through, and the later reap
+-- then stops here on nil ~= 3. Without this guard the second call would reach
+-- unregister_channel_events, which indexes _registered_channel_objects[name] and
+-- reads .__size off it with no nil check -- a throw inside the connection state
+-- machine. The two are a pair; removing either one re-arms the other.
+--
+-- Scope, honestly: this does NOT fix the "straight to operative select" reports.
+-- Those came through MultiplayerSessionManager._handle_session_error, and their
+-- cause was a conflict with InstantHub 3.x "Reserve Mourningstar Server", not
+-- this. Confirmed firing and holding in the 2026-09-13 logs, but what it buys is
+-- the hub surviving the reap -- not the bounce.
+mod:hook(CLASS.MechanismManager, "disconnect", function (func, self, channel_id)
+	local host_channel = self._mechanism_host_channel
+
+	if host_channel ~= channel_id then
+		_trace("Ignoring disconnect for channel " .. tostring(channel_id)
+			.. " -- not our mechanism host (" .. tostring(host_channel) .. "), mechanism "
+			.. tostring(self._mechanism_name) .. " stays")
+
+		return
+	end
+
+	return func(self, channel_id)
 end)
 
 -- Presence is derived from the session's host type, so a locally hosted hub
@@ -880,4 +1109,26 @@ mod:command("solohub", mod:localize("command_description"), function ()
 	if _pending_session then
 		mod:echo("  waiting on a booting solo hub session")
 	end
+
+	local mechanism_host_channel = mechanism_manager and mechanism_manager._mechanism_host_channel
+
+	-- The field behind both 0.3.x bugs. In a solo hub it must be nil; a number
+	-- here means a mission server still owns this client's mechanism events and
+	-- the next transition will bounce to operative select.
+	mod:echo("  mechanism host channel: " .. tostring(mechanism_host_channel)
+		.. (mechanism_host_channel and " (STALE -- report this)" or " (clear)"))
 end)
+
+-- Load banner, deliberately last and deliberately unconditional.
+--
+-- Three reporter logs came in against 0.3.0/0.3.1 and none of them could be
+-- told apart by build: nothing this mod writes at load carried a version, and
+-- the lines that did appear were unconditional mod:info calls that have looked
+-- the same since 0.2.x. That made "are they even running the fixed build"
+-- unanswerable, and it was the slowest part of the whole investigation. One
+-- line at load fixes that permanently.
+_trace("SoloMourningstar " .. mod.version .. " loaded"
+	.. " (solo_hub_on_enter: " .. tostring(mod:get("solo_hub_on_enter"))
+	.. ", solo_hub_after_mission: " .. tostring(mod:get("solo_hub_after_mission"))
+	.. ", first_person_hub: " .. tostring(mod:get("first_person_hub"))
+	.. ", debug_logging: " .. tostring(mod:get("debug_logging")) .. ")")

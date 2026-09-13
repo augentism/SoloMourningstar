@@ -49,3 +49,36 @@ add a compatibility guard on my end instead.
 
 **Players:** if something misbehaves only in the private Mourningstar and works
 normally in a public hub, please post a log. It is almost always this.
+
+## Owning the post-mission hub session
+
+There is a second, narrower way to conflict with this mod, and one mod already
+does.
+
+When a mission ends, `StateMissionServerExit` asks for a hub session:
+
+```lua
+-- state_mission_server_exit.lua:41-42
+if not DEDICATED_SERVER and GameParameters.prod_like_backend and not self._multiplayer_session then
+    self._multiplayer_session = Managers.multiplayer_session:party_immaterium_hot_join_hub_server()
+end
+```
+
+Solo Mourningstar hooks that `party_immaterium_hot_join_hub_server` call and
+substitutes a locally hosted session. **InstantHub 3.x's "Reserve Mourningstar
+Server"** instead pre-reserves a real hub-server session and assigns it to
+`self._multiplayer_session` from its own `StateMissionServerExit.update` hook —
+so the `not self._multiplayer_session` guard is already false and the hot-join
+call never happens.
+
+Neither mod is wrong on its own. They are both trying to own the same session,
+at different seams, and which one wins is a race on whether the reservation
+landed in time. Symptoms are the mission drop-in screen shown for a hub load, a
+stall of a minute or so while `HostWaitForMissionBriefingDoneState` waits for a
+briefing that never comes, then a bounce to operative select.
+
+**If your mod also substitutes or pre-reserves the post-mission hub session**,
+please get in touch — this needs a convention rather than each of us hooking a
+different seam and hoping. In the meantime the workaround is to turn one of them
+off, and the check that tells you whether a session is already spoken for is the
+same `self._multiplayer_session` the engine uses.

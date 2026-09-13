@@ -296,6 +296,27 @@ read during the load that follows — so toggling the setting takes effect on th
 next hub load. The stock values are restored whenever we are heading for a
 public hub, so a real hub server is never loaded with combat settings patched in.
 
+**That last sentence was only true of two of the three pass-throughs until
+0.3.5.** `party_immaterium_hot_join_hub_server`'s settings-off branch — the one
+reached whenever `solo_hub_after_mission` is off — returned to vanilla without
+restoring them. Since the overrides live on the *shared* `GameModeSettings.hub`,
+they applied to every player unit in that public hub, remote ones included: the
+next stranger to hot-join had their husk built from the combat template, whose
+animation state machine carries no hub aim constraint target.
+
+```
+spawn_husk_unit → wield_slot → set_anim_state_machine
+  → PlayerUnitHubAimExtension.state_machine_changed
+  → HubAimConstraints.init → animation_find_constraint_target
+"State machine has no constraint target named ... in unit ..."
+```
+
+A hard crash inside somebody else's husk spawn, with nothing on screen tying it
+to a first-person setting, and only while both `first_person_hub` was on *and*
+`solo_hub_after_mission` was off. Found by `tests/ingame/paths.sh`, not by a
+player. Fixed in 0.3.5; `tests/` now asserts that a public hub always loads
+stock.
+
 There is no respawn in the hub (no `respawn` block in the game mode, same as the
 Psykhanium), so dying means going back to character select and loading in again.
 That is accepted behaviour rather than an oversight.
@@ -311,17 +332,105 @@ remaining hub/Psykhanium difference. Restoring the full combat HUD, the first
 suspect, did not fix it. Unexamined deltas: the level's own spawn and respawn
 infrastructure, and `is_social_hub`.
 
+## The mission channel outliving the swap
+
+Taking the hub mechanism after a mission does not close the mission server's
+channel. `change_mechanism` clears neither `_mechanism_host_channel` nor the
+events registered on it (`mechanism_manager.lua:238-272`) — only
+`MechanismManager.disconnect` does, and nothing was calling it. So a dedicated
+server the player has walked away from stays wired to the client for the minute
+or so it takes to time out, and three separate pieces of engine code read that
+state in the meantime.
+
+Three guards, added 0.3.1–0.3.3, and they are one mechanism rather than three
+fixes — removing any one re-arms another:
+
+| part | what it does |
+| --- | --- |
+| 1 (0.3.2) | `disconnect(host_channel)` before the swap, closing it at the source |
+| 2 (0.3.1) | drops `rpc_mechanism_event`s the installed mechanism has no handler for |
+| 3 (0.3.3) | ignores `MechanismManager.disconnect` for a channel that is not the current host |
+
+Part 1 is the only one that removes the condition; 2 and 3 survive it. The
+confirmed consequence of leaving the channel open was a **hard crash**: with it
+live, `rpc_mechanism_event` still fires, so the server's end-of-round
+`game_score_done` is dispatched into `MechanismHub`, which has no such handler —
+a nil call in the RPC dispatcher with no `pcall` above it, roughly 45 seconds
+after a mission the player already left. Reproduced twice with full dumps.
+
+Part 3 exists because `LocalDisconnectedState.init`
+(`local_disconnected_state.lua:15`) calls `disconnect` for *any* channel that
+finishes dying, and `disconnect` ends in an unconditional `leave_mechanism()`
+with no check that the channel owns the current mechanism. Without the guard,
+the mission channel reaping itself destroys the hub the player is standing in.
+
+**Part 3 does not fix the "straight to operative select" reports.** Those came
+through `MultiplayerSessionManager._handle_session_error`, and their cause was a
+conflict with InstantHub — see below.
+
+## Known conflict: InstantHub "Reserve Mourningstar Server"
+
+InstantHub 3.x added `reserve_hub_server`, which pre-reserves a hub-server
+session and installs it from a `StateMissionServerExit.update` hook. Vanilla's
+guard there is `not self._multiplayer_session`
+(`state_mission_server_exit.lua:41-42`), so when the reservation lands first,
+`party_immaterium_hot_join_hub_server` is never called and this mod's
+substitution never runs. Both mods are trying to own the post-mission hub
+session, at different seams.
+
+Symptoms: the wrong loading screen (the mission drop-in screen for a hub load),
+a stall of a minute or so, then a bounce to operative select. **Turn
+"Reserve Mourningstar Server" off.** Confirmed by the reporter as a fix.
+
 ## Settings
 
-- **Private Mourningstar** (default on) — the main toggle.
-- **Also after missions** (default on) — covers `StateMissionServerExit`. This is
-  the riskier path (a mission-server session is still alive when it fires); turn
-  it off if returning from a mission misbehaves, and entering from character
-  select still works.
-- **Debug logging** — session boot and mechanism changes to the console log.
+- **Private Mourningstar** (default on) — the main toggle, and the base gate:
+  with it off the mod does nothing, including the after-mission path.
+- **Also after missions** (default on) — the return trip. This is the riskier
+  path (a mission-server session is still alive when it fires); turn it off if
+  returning from a mission misbehaves, and entering from character select still
+  works.
+- **First person Mourningstar** (default off) — see above.
+- **Debug logging** — extra per-frame detail. The `[trace]` lines below are
+  written regardless.
 
-`/solohub` in chat reports the mod version, host type, mechanism, game mode and
-presence.
+Since 0.3.4, **Also after missions** governs *both* ways off the end screen.
+It previously gated only `party_immaterium_hot_join_hub_server`, which the timer
+and the player-summary continue reach; the main Continue button instead calls
+`multiplayer_session:leave("skip_end_of_round")` and returns through
+`MechanismLeftSession` → `find_available_session`, which was gated on
+**Private Mourningstar** instead. Players who turned the setting off still got
+the solo hub every time they pressed Continue.
+
+The gate now reads `left_session_reason` off the mechanism rather than hooking
+each exit, so it covers every route at once — including ones nobody has thought
+of, which is the mistake it is fixing. `skip_end_of_round`, `session_completed`,
+`leave_mission`, `leave_mission_stay_in_party` and
+`failed_fetching_session_report` count as mission exits; `leave_to_hub` (the
+Psykhanium) and character select fall under **Private Mourningstar**, because the
+Meat Grinder is not a mission.
+
+## Diagnostics
+
+`/solohub` in chat reports the mod version, host type, mechanism, game mode,
+presence, and the mechanism host channel — which must be `nil` in a solo hub. A
+number there is the condition behind both 0.3.x failure modes and is worth
+reporting.
+
+The mod also writes unconditional `[trace]` lines to the console log: a load
+banner with the version and every setting, each solo-hub boot tagged with which
+entry path took it, the channel teardown, and any dropped mechanism event.
+These are deliberately not behind **Debug logging** — three rounds of bug
+reports were unreadable because there was no way to tell which build a reporter
+was on, or which of the two after-mission paths they took.
+
+To identify a reporter's build from a log:
+
+```
+grep "\[trace\] SoloMourningstar" <log>
+```
+
+No output means 0.3.1 or earlier.
 
 ## Releasing
 
@@ -345,9 +454,33 @@ overwrite an existing zip.
 - Menus (mission board, vendors, crafting, penances, inventory) are backend HTTP
   and unaffected by who hosts the level.
 
+## Testing
+
+`tests/` drives a running game through dt-cli and walks the whole route —
+character select → hub → Psykhanium → hub → mission → win → hub → mission —
+across every combination of **First person Mourningstar** and **Also after
+missions**, twice each for the two end-screen exits. Eight rows, 100 assertions.
+
+```bash
+nix develop ./nix --command python3 SoloMourningstar/tests/run_tests.py
+```
+
+It launches the game if it is down and closes it afterwards (only one it
+started). Missions go through SoloPlay, so nothing it does lands in a stranger's
+run. `SM_SMOKE=1 bash tests/ingame/paths.sh` runs two rows instead of eight.
+
+There is no offline tier and should not be one: this mod is hooks over
+`MultiplayerSessionManager` and `MechanismManager`, and a harness that faked
+those would only test the fake. See `tests/README.md`, including the known gap —
+SoloPlay missions return through `find_available_session`, so the suite never
+exercises `party_immaterium_hot_join_hub_server`.
+
 ## Status
 
-Tested in-game as of 0.1.3 (2026-08-07), all working:
+Green as of **0.3.5** (2026-09-13): `paths: 100 passed, 0 failed`, every
+combination of both settings and both end-screen exits.
+
+Earlier, tested in-game as of 0.1.3 (2026-08-07), all working:
 
 - Entering the private Mourningstar from character select
 - Starting missions from it, and party invites
