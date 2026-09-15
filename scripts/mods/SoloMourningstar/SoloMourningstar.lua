@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.3.5"
+mod.version = "0.3.6"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -70,6 +70,37 @@ end
 
 local function _solo_enabled()
 	return mod:is_enabled() and mod:get("solo_hub_on_enter")
+end
+
+-- Published for other mods. True when a mission ending now will be followed by
+-- us hosting the hub, rather than the game joining a public one.
+--
+-- It exists because `party_immaterium_hot_join_hub_server` is NOT a safe probe
+-- once this mod is loaded: calling it boots a session. InstantHub 3.x calls it
+-- speculatively to pre-reserve a hub server, gets our locally hosted session
+-- back, decides it is not the hub-server boot it wanted, and calls
+-- `clear_session_boot()` on it -- destroying the session we are waiting on. The
+-- player then gets the mission drop-in loading screen for a hub load, a stall,
+-- and a bounce to operative select.
+--
+-- So anything that wants to know "will Solo Mourningstar take the hub after this
+-- mission?" should ask here rather than calling that method to find out:
+--
+--   local solo = get_mod("SoloMourningstar")
+--   if solo and type(solo.will_host_hub_after_mission) == "function"
+--       and solo.will_host_hub_after_mission() then
+--       return -- leave the post-mission hub to it
+--   end
+--
+-- The hot-join hook below is the only other reader, so this answer cannot drift
+-- from the behaviour it describes. Keep it that way: if the gate changes, change
+-- it here.
+function mod.will_host_hub_after_mission()
+	if not _solo_enabled() then
+		return false
+	end
+
+	return mod:get("solo_hub_after_mission") == true
 end
 
 -- True once we are actually in a locally hosted hub, loading included. Reads
@@ -412,7 +443,9 @@ end)
 -- since it is the riskier of the two paths (a mission-server session is still
 -- alive at this point).
 mod:hook(CLASS.MultiplayerSessionManager, "party_immaterium_hot_join_hub_server", function (func, self)
-	if not (_solo_enabled() and mod:get("solo_hub_after_mission")) then
+	-- Same predicate other mods read, deliberately: one definition, so the
+	-- published answer and the actual behaviour cannot disagree.
+	if not mod.will_host_hub_after_mission() then
 		-- Heading for a public hub, so the combat settings must come back off
 		-- first -- the same reason the branch below and find_available_session
 		-- both do it. This branch did not, and it is the one reached whenever

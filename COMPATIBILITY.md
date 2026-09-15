@@ -65,20 +65,40 @@ end
 ```
 
 Solo Mourningstar hooks that `party_immaterium_hot_join_hub_server` call and
-substitutes a locally hosted session. **InstantHub 3.x's "Reserve Mourningstar
-Server"** instead pre-reserves a real hub-server session and assigns it to
-`self._multiplayer_session` from its own `StateMissionServerExit.update` hook —
-so the `not self._multiplayer_session` guard is already false and the hot-join
-call never happens.
+substitutes a locally hosted session.
 
-Neither mod is wrong on its own. They are both trying to own the same session,
-at different seams, and which one wins is a race on whether the reservation
-landed in time. Symptoms are the mission drop-in screen shown for a hub load, a
-stall of a minute or so while `HostWaitForMissionBriefingDoneState` waits for a
-briefing that never comes, then a bounce to operative select.
+**So that method is not a safe probe once this mod is loaded — calling it boots a
+session.** That is the thing to know, and it is what broke InstantHub 3.x's
+"Reserve Mourningstar Server": it calls the method speculatively to set up its
+reservation, gets our locally hosted session back, correctly decides it is not the
+hub-server boot it wanted, and calls `clear_session_boot()` on it — destroying the
+session we are waiting on. The player gets the mission drop-in loading screen for a
+hub load, a minute-long stall, and a bounce to operative select.
+
+Neither mod is unreasonable in isolation. The probe simply is not read-only.
+
+### Ask instead of probing
+
+Solo Mourningstar 0.3.6 publishes a predicate for exactly this:
+
+```lua
+local solo = get_mod("SoloMourningstar")
+
+if solo and type(solo.will_host_hub_after_mission) == "function"
+    and solo.will_host_hub_after_mission() then
+    return -- leave the post-mission hub session to it
+end
+```
+
+It returns `true` only when a mission ending now will be followed by us hosting
+the hub, accounting for the mod being toggled off and for both settings. It is
+backed by the same expression our own hook reads, so it cannot drift from the
+behaviour it describes, and the `type(...) == "function"` test degrades cleanly
+against older versions or no Solo Mourningstar at all.
+
+There is a fuller write-up of the InstantHub case, with the exact code and a
+suggested patch, in `INSTANTHUB-REPORT.md`.
 
 **If your mod also substitutes or pre-reserves the post-mission hub session**,
 please get in touch — this needs a convention rather than each of us hooking a
-different seam and hoping. In the meantime the workaround is to turn one of them
-off, and the check that tells you whether a session is already spoken for is the
-same `self._multiplayer_session` the engine uses.
+different seam and hoping.
