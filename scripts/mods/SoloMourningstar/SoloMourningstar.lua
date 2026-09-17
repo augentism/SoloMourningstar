@@ -3,7 +3,7 @@ local mod = get_mod("SoloMourningstar")
 -- Single source of truth for the version: release_mod.py reads it from here to
 -- name the zip, and /solohub reports it so a user's screenshot says which build
 -- they are on.
-mod.version = "0.3.6"
+mod.version = "0.3.7"
 
 -- Entering the Mourningstar normally means queueing for a public hub server:
 -- fetch a hub queue ticket, gRPC hot-join, fetch server details, DTLS handshake,
@@ -185,8 +185,25 @@ end
 -- explanation is logged once however it first fires.
 local _warned_cleared_remote = false
 
+-- Realms replaces our singleplayer boot with a player-hosted session. Its
+-- clients report the same host type, so also require local ownership. Loading
+-- ownership is available before gameplay creates the hub UI.
+local function _in_latency_suppressed_hub()
+	if _in_solo_hub() then
+		return true
+	end
+
+	local session_manager = Managers.multiplayer_session
+	local mechanism_manager = Managers.mechanism
+	local loading_manager = Managers.loading
+
+	return session_manager ~= nil and session_manager:host_type() == HOST_TYPES.player
+		and mechanism_manager ~= nil and mechanism_manager:mechanism_name() == HUB_MECHANISM
+		and loading_manager ~= nil and loading_manager:is_host()
+end
+
 local function _keep_local_player_local()
-	if not _in_solo_hub() then
+	if not _in_latency_suppressed_hub() then
 		return
 	end
 
@@ -205,7 +222,8 @@ local function _keep_local_player_local()
 	end
 end
 
--- Better than clearing: stop ArtificialLatency writing the flag at all.
+-- Better than clearing: stop ArtificialLatency and Realms Latency writing the
+-- flag at all. The fork uses different names for its cache and saved setting.
 --
 -- Both of its write paths early-out on its own cached setting being zero --
 -- set_player_props then takes the branch that actively clears the flag, and the
@@ -216,7 +234,7 @@ end
 -- always one step behind at the worst moment: set_player_props fires from that
 -- mod's on_game_state_changed as gameplay is entered, which is when the hub
 -- builds its UI, so the button code can read the flag before our next frame.
--- `_in_solo_hub()` is already true during loading, so the cache is zero before
+-- `_in_latency_suppressed_hub()` is already true during loading, so the cache is zero before
 -- that callback runs.
 --
 -- The restore reads their own setting rather than a value we remembered, so a
@@ -224,35 +242,35 @@ end
 -- the one place the mod reaches into another mod's internals; the generic
 -- clears stay as the mod-agnostic net, and cover anything else that flags the
 -- local player remote.
-local _al_suppressed = false
+local _latency_suppressed = {}
 
-local function _hold_artificial_latency_off()
-	local artificial_latency = get_mod("ArtificialLatency")
-	local settings = artificial_latency and artificial_latency.settings
+local function _hold_latency_mod_off(mod_name, cache_key, setting_id)
+	local latency_mod = get_mod(mod_name)
+	local settings = latency_mod and latency_mod.settings
 
 	if type(settings) ~= "table" then
 		return
 	end
 
-	if _in_solo_hub() then
-		if settings.al_ms ~= 0 then
-			settings.al_ms = 0
+	if _in_latency_suppressed_hub() then
+		if settings[cache_key] ~= 0 then
+			settings[cache_key] = 0
 
-			if not _al_suppressed then
-				_al_suppressed = true
+			if not _latency_suppressed[mod_name] then
+				_latency_suppressed[mod_name] = true
 
-				mod:info("Holding ArtificialLatency at 0 ms while in the solo hub (its remote flag hides the hub UI)")
+				mod:info("Holding %s at 0 ms while in the solo hub (its remote flag hides the hub UI)", mod_name)
 			end
 		end
-	elseif _al_suppressed then
-		_al_suppressed = false
+	elseif _latency_suppressed[mod_name] then
+		_latency_suppressed[mod_name] = nil
 
 		local ok, value = pcall(function ()
-			return artificial_latency:get("al_ms")
+			return latency_mod:get(setting_id)
 		end)
 
 		if ok and value then
-			settings.al_ms = value
+			settings[cache_key] = value
 		end
 	end
 end
@@ -495,7 +513,8 @@ end)
 -- session is established -- via rpc_set_mechanism from the hub server.
 mod:hook_safe(CLASS.MultiplayerSessionManager, "update", function (self, dt)
 	_keep_pacing_disabled()
-	_hold_artificial_latency_off()
+	_hold_latency_mod_off("ArtificialLatency", "al_ms", "al_ms")
+	_hold_latency_mod_off("Realms Latency", "latency_ms", "rl_latency_ms")
 	_keep_local_player_local()
 
 	if not _pending_session then
@@ -801,7 +820,7 @@ mod:hook(PlayerUnitSpawnManager, "owner", function (func, self, unit)
 		return owner
 	end
 
-	if not _in_solo_hub() then
+	if not _in_latency_suppressed_hub() then
 		return owner
 	end
 

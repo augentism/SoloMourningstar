@@ -236,7 +236,7 @@ documented safe window.
 
 ## Artificial latency (hub UI disappearing)
 
-ArtificialLatency does not delay packets — it fakes latency by setting
+ArtificialLatency and its Realms Latency fork do not delay packets — they fake latency by setting
 `player.remote = true` on your own player so the server lag-compensates you.
 Its gate is only `game_session:is_server()`, which in vanilla means the
 Psykhanium or a solo mission. A hosted hub satisfies it too, and hub UI
@@ -260,9 +260,18 @@ as gameplay is entered, which is exactly when the hub builds its UI:
 - **A frame-level clear**, for anything reading `player.remote` without going
   through `owner()`.
 
-The prevention layer is the one place this mod reaches into another mod's
-internals. The other two are mod-agnostic and cover anything else that flags the
-local player as remote.
+The prevention layer supports both ArtificialLatency (`settings.al_ms`, saved
+setting `al_ms`) and Realms Latency (`settings.latency_ms`, saved setting
+`rl_latency_ms`). Each cache is suppressed independently and restored from its
+current saved setting on leaving the private hub, including changes made while
+in the hub. This is the one place this mod reaches into another mod's internals.
+The other two are mod-agnostic and cover anything else that flags the local
+player as remote.
+
+Realms replaces the solo session with host type `player`, so latency suppression
+also recognizes a hub with that host type when this machine is the loading
+host. That ownership check excludes clients joining somebody else's Realms
+hub. It applies to all three latency guards, including during hub loading.
 
 Lag compensation only affects hit registration and the hub has no combat, so
 suppressing it there costs nothing; missions and the Psykhanium are untouched.
@@ -476,6 +485,11 @@ SoloPlay missions return through `find_available_session`, so the suite never
 exercises `party_immaterium_hot_join_hub_server`.
 
 ## Status
+
+**0.3.7** (2026-09-17): Realms Latency compatibility verified live. Hub buttons
+remain visible with the cached latency suppressed to 0 ms and the local player
+no longer flagged remote. Entering a Realms mission restores the saved 25 ms
+latency, the remote flag, and the player's 25 ms lag-compensation value.
 
 Green as of **0.3.5** (2026-09-13): `paths: 100 passed, 0 failed`, every
 combination of both settings and both end-screen exits.
